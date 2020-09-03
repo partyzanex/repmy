@@ -26,8 +26,12 @@ func (repo *Repository) FlushTable(ctx context.Context, table string) (sql.Resul
 	return repo.db.ExecContext(ctx, fmt.Sprintf("FLUSH TABLES `%s`", table))
 }
 
-func (repo *Repository) UnlockTable(ctx context.Context, table string) (sql.Result, error) {
+func (repo *Repository) UnlockTables(ctx context.Context) (sql.Result, error) {
 	return repo.db.ExecContext(ctx, "UNLOCK TABLES")
+}
+
+func (repo *Repository) FlushTablesWithReadLock(ctx context.Context) (sql.Result, error) {
+	return repo.db.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK")
 }
 
 func (repo *Repository) GetTables(ctx context.Context) ([]*Table, error) {

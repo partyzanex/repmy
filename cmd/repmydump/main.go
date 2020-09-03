@@ -4,12 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
+	"github.com/sirupsen/logrus"
 	"os"
 	"os/signal"
 
 	"github.com/partyzanex/repmy/pkg/dump"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -22,9 +21,9 @@ var (
 	port    = pflag.Uint16P("port", "P", 3306, "port")
 	dbname  = pflag.StringP("database", "d", "", "database")
 	workers = pflag.IntP("treads", "t", 1, "number of treads")
-	limit   = pflag.IntP("limit", "l", 0, "limit of rows")
+	limit   = pflag.IntP("limit", "l", 10000, "limit of rows")
 	verbose = pflag.BoolP("verbose", "v", false, "verbose progress")
-	file    = pflag.StringP("file", "f", "", "file path")
+	output  = pflag.StringP("output", "o", "dump", "output dir")
 
 	tables = pflag.StringSlice("tables", []string{}, "tables list")
 
@@ -32,10 +31,16 @@ var (
 	noDropTable   = pflag.Bool("no-drop-table", false, "dump tables without DROP TABLE IF EXISTS ...")
 	noCreateTable = pflag.Bool("no-create-table", false, "dump tables without DLL (data only)")
 	noData        = pflag.Bool("no-data", false, "dump only DLL (without data)")
+
+	debug = pflag.Bool("debug", false, "debug mode")
 )
 
 func main() {
 	pflag.Parse()
+
+	if *debug {
+		logrus.SetLevel(logrus.DebugLevel)
+	}
 
 	if *user == "" {
 		fatal("flag --user is required")
@@ -43,6 +48,16 @@ func main() {
 
 	if *dbname == "" {
 		fatal("flag --db is required")
+	}
+
+	if *output == "" {
+		fatal("flag --output is required")
+	}
+
+	if err := os.MkdirAll(*output, 0755); err != nil {
+		if !os.IsExist(err) {
+			fatal(err.Error())
+		}
 	}
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", *user, *pass, *host, *port, *dbname)
@@ -62,16 +77,15 @@ func main() {
 		cancel()
 	}()
 
-	logrus.SetLevel(logrus.DebugLevel)
-
-	if *file == "" {
-		logrus.SetFormatter(&dump.Formatter{
-			Formatter: &logrus.TextFormatter{},
-		})
-	}
+	//if *file == "" {
+	//	logrus.SetFormatter(&dump.Formatter{
+	//		Formatter: &logrus.TextFormatter{},
+	//	})
+	//}
 
 	d := dump.Dumper{
 		DB:            db,
+		Output:        *output,
 		Workers:       *workers,
 		Limit:         *limit,
 		NoHeaders:     *noHeaders,
@@ -81,25 +95,7 @@ func main() {
 		Verbose:       *verbose,
 	}
 
-	var w io.Writer = os.Stdout
-
-	if *file != "" {
-		dst, err := os.Create(*file)
-		if err != nil {
-			fatal(err.Error())
-		}
-
-		defer func() {
-			err := dst.Close()
-			if err != nil {
-				fatal(err.Error())
-			}
-		}()
-
-		w = dst
-	}
-
-	err = d.Dump(ctx, w, *tables...)
+	err = d.Dump(ctx, *tables...)
 	if err != nil {
 		fatal(err.Error())
 	}

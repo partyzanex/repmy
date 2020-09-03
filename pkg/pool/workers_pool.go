@@ -99,7 +99,7 @@ const (
 func NewWorkersPool(options ...Option) *WorkersPool {
 	p := &WorkersPool{
 		size:  DefaultPoolSize,
-		tasks: make(chan Task, 10000),
+		tasks: make(chan Task),
 		errs:  make(chan error),
 		wg:    &sync.WaitGroup{},
 		mu:    &sync.Mutex{},

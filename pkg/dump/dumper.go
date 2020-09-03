@@ -8,7 +8,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/partyzanex/repmy/pkg/pool"
@@ -28,7 +27,7 @@ type Dumper struct {
 	Verbose       bool
 }
 
-const sep = "\n-- separator --\n"
+const Separator = "\n-- separator --\n"
 
 func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 	repo := New(d.DB)
@@ -81,19 +80,21 @@ func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 		return nil
 	}, nil)
 
+	_, err = repo.FlushTablesWithReadLock(ctx)
+	if err != nil {
+		return fmt.Errorf("flush tables with read lock failed: %s", err)
+	}
+
+	defer func() {
+		_, err = repo.UnlockTables(ctx)
+		if err != nil {
+			logrus.Error(err)
+		}
+	}()
+
 	for i := 0; i < d.Workers; i++ {
 		processes.RunProcess(ctx, func(ctx context.Context) error {
 			for table := range tch {
-				_, err := repo.FlushTable(ctx, table.Name)
-				if err != nil {
-					return err
-				}
-
-				_, err = repo.LockRead(ctx, table.Name)
-				if err != nil {
-					return err
-				}
-
 				if d.Verbose {
 					logrus.Infof("start dump table '%s'", table.Name)
 				}
@@ -112,7 +113,7 @@ func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 				}()
 
 				for result := range results {
-					_, err := io.WriteString(file, result+sep)
+					_, err := io.WriteString(file, result+Separator)
 					if err != nil {
 						n := len(result)
 						if n > 100 {
@@ -130,11 +131,6 @@ func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 
 				if d.Verbose {
 					logrus.Infof("finished dump table '%s'", table.Name)
-				}
-
-				_, err = repo.UnlockTable(ctx, table.Name)
-				if err != nil {
-					return err
 				}
 			}
 
@@ -154,12 +150,13 @@ func (d *Dumper) DumpTable(ctx context.Context, table Table) (<-chan string, <-c
 
 	go func() {
 		defer func() {
+			logrus.Debugf("dump table %s finished", table.Name)
 			close(results)
 			close(errors)
+			logrus.Debugf("dump table %s: closed channels", table.Name)
 		}()
 
 		repo := New(d.DB)
-		workers := pool.NewWorkersPool(pool.Size(1))
 
 		if !d.NoHeaders {
 			results <- fmt.Sprintf("\n--\n-- Structure for table `%s`\n--\n\n", table.Name)
@@ -209,6 +206,18 @@ func (d *Dumper) DumpTable(ctx context.Context, table Table) (<-chan string, <-c
 			dataHeader += fmt.Sprintf("-- %s's data\n", table.Name)
 		}
 
+		size := int(count) / limit
+
+		if size >= d.Workers {
+			size = d.Workers / 2
+		}
+
+		if size == 0 {
+			size = 1
+		}
+
+		workers := pool.NewWorkersPool(pool.Size(size))
+
 		for i := 0; i < n; i++ {
 			workers.AddTask(&task{
 				UID:    i + 1,
@@ -226,14 +235,14 @@ func (d *Dumper) DumpTable(ctx context.Context, table Table) (<-chan string, <-c
 
 					results <- dataHeader + strings.Join(inserts, "\n")
 
-					runtime.Gosched()
-
 					return nil
 				},
 			})
 		}
 
+		logrus.Debugf("table %s: start wait", table.Name)
 		workers.Wait()
+		logrus.Debugf("table %s: end wait", table.Name)
 	}()
 
 	return results, errors
