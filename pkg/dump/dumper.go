@@ -1,14 +1,13 @@
 package dump
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/partyzanex/repmy/pkg/pool"
 	"github.com/sirupsen/logrus"
@@ -27,14 +26,46 @@ type Dumper struct {
 	Verbose       bool
 }
 
-const Separator = "\n-- separator --\n"
-
 func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
+	toDump, err := d.getTablesForDump(ctx, tables...)
+	if err != nil {
+		return err
+	}
+
+	repo := New(d.DB)
+
+	if d.Verbose {
+		logrus.Infof("flush tables with read lock")
+	}
+
+	_, err = repo.FlushTablesWithReadLock(ctx)
+	if err != nil {
+		return fmt.Errorf("flush tables with read lock failed: %s", err)
+	}
+
+	defer func() {
+		_, err = repo.UnlockTables(ctx)
+		if err != nil {
+			logrus.Error(err)
+			return
+		}
+
+		if d.Verbose {
+			logrus.Infof("unlock tables for read")
+		}
+	}()
+
+	d.Run(ctx, toDump...)
+
+	return nil
+}
+
+func (d *Dumper) getTablesForDump(ctx context.Context, tables ...string) ([]*Table, error) {
 	repo := New(d.DB)
 
 	tbs, err := repo.GetTables(ctx)
 	if err != nil {
-		return fmt.Errorf("unable to get tables: %s", err)
+		return nil, fmt.Errorf("unable to get tables: %s", err)
 	}
 
 	var (
@@ -50,7 +81,7 @@ func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 		for _, table := range tables {
 			tbl, ok := uniq[table]
 			if !ok {
-				return fmt.Errorf("table %s is not exists", table)
+				return nil, fmt.Errorf("table %s is not exists", table)
 			}
 
 			toDump = append(toDump, tbl)
@@ -59,9 +90,17 @@ func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 		toDump = tbs
 	}
 
-	tch := make(chan *Table, len(toDump))
+	return toDump, nil
+}
 
-	for _, table := range toDump {
+func (d *Dumper) Run(ctx context.Context, tables ...*Table) {
+	if d.Verbose {
+		logrus.Infof("runs dump for %d tables", len(tables))
+	}
+
+	tch := make(chan *Table, len(tables))
+
+	for _, table := range tables {
 		tch <- table
 	}
 
@@ -80,189 +119,179 @@ func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 		return nil
 	}, nil)
 
-	_, err = repo.FlushTablesWithReadLock(ctx)
-	if err != nil {
-		return fmt.Errorf("flush tables with read lock failed: %s", err)
+	if d.Verbose {
+		logrus.Infof("runs %d processes", d.Workers)
 	}
 
-	defer func() {
-		_, err = repo.UnlockTables(ctx)
-		if err != nil {
-			logrus.Error(err)
-		}
-	}()
-
 	for i := 0; i < d.Workers; i++ {
-		processes.RunProcess(ctx, func(ctx context.Context) error {
-			for table := range tch {
-				if d.Verbose {
-					logrus.Infof("start dump table '%s'", table.Name)
-				}
-
-				results, errs := d.DumpTable(ctx, *table)
-
-				file, err := os.Create(filepath.Join(d.Output, table.Name+".sql"))
-				if err != nil {
-					return err
-				}
-
-				go func() {
-					for err := range errs {
-						logrus.Error(err)
-					}
-				}()
-
-				for result := range results {
-					_, err := io.WriteString(file, result+Separator)
-					if err != nil {
-						n := len(result)
-						if n > 100 {
-							n = 100
-						}
-
-						return fmt.Errorf("write %s... failed: %s", result[0:n], err)
-					}
-				}
-
-				err = file.Close()
-				if err != nil {
-					return err
-				}
-
-				if d.Verbose {
-					logrus.Infof("finished dump table '%s'", table.Name)
-				}
-			}
-
-			return nil
-		}, nil)
+		processes.RunProcess(ctx, d.processDump(tch), nil)
 	}
 
 	processes.Wait()
 	errors.Wait()
-
-	return nil
 }
 
-func (d *Dumper) DumpTable(ctx context.Context, table Table) (<-chan string, <-chan error) {
-	results := make(chan string)
-	errors := make(chan error)
-
-	go func() {
-		defer func() {
-			logrus.Debugf("dump table %s finished", table.Name)
-			close(results)
-			close(errors)
-			logrus.Debugf("dump table %s: closed channels", table.Name)
-		}()
-
-		repo := New(d.DB)
-
-		if !d.NoHeaders {
-			results <- fmt.Sprintf("\n--\n-- Structure for table `%s`\n--\n\n", table.Name)
-		}
-
-		if !d.NoDropTable {
-			results <- fmt.Sprintf("DROP TABLE IF EXISTS `%s`;\n", table.Name)
-		}
-
-		if !d.NoCreateTable {
-			dll, err := repo.GetCreateTable(ctx, table)
-			if err != nil {
-				errors <- err
-				return
+func (d *Dumper) processDump(tables <-chan *Table) pool.Process {
+	return func(ctx context.Context) error {
+		for table := range tables {
+			if d.Verbose {
+				logrus.Infof("starting dump for table '%s'", table.Name)
 			}
 
-			results <- fmt.Sprintf("%s;\n", dll)
+			err := d.dumpTable(ctx, table)
+			if err != nil {
+				return err
+			}
+
+			if d.Verbose {
+				logrus.Infof("finished dump for table '%s'", table.Name)
+			}
 		}
 
-		if d.NoData {
-			return
-		}
-
-		count, err := repo.Count(ctx, table.Name)
-		if err != nil {
-			errors <- err
-			return
-		}
-
-		n := 1
-		limit := 0
-
-		if d.Limit > 0 {
-			n = int(math.Ceil(float64(count) / float64(d.Limit)))
-			limit = d.Limit
-		}
-
-		columns, err := repo.GetTableColumns(ctx, table.Name)
-		if err != nil {
-			errors <- err
-			return
-		}
-
-		dataHeader := "\n"
-
-		if !d.NoHeaders {
-			dataHeader += fmt.Sprintf("-- %s's data\n", table.Name)
-		}
-
-		size := int(count) / limit
-
-		if size >= d.Workers {
-			size = d.Workers / 2
-		}
-
-		if size == 0 {
-			size = 1
-		}
-
-		workers := pool.NewWorkersPool(pool.Size(size))
-
-		for i := 0; i < n; i++ {
-			workers.AddTask(&task{
-				UID:    i + 1,
-				Limit:  limit,
-				Offset: i * limit,
-				RunFunc: func(t *task) error {
-					defer logrus.Debugf("Task %d finished for table '%s'", t.ID(), table.Name)
-
-					query := repo.GetSelectQuery(columns, table.Name, t.Limit, t.Offset)
-
-					inserts, err := repo.GetInserts(ctx, query, table)
-					if err != nil {
-						return fmt.Errorf("unable to get inserts: %s", err)
-					}
-
-					results <- dataHeader + strings.Join(inserts, "\n")
-
-					return nil
-				},
-			})
-		}
-
-		logrus.Debugf("table %s: start wait", table.Name)
-		workers.Wait()
-		logrus.Debugf("table %s: end wait", table.Name)
-	}()
-
-	return results, errors
+		return nil
+	}
 }
 
-type Formatter struct {
-	logrus.Formatter
-}
+func (d *Dumper) dumpTable(ctx context.Context, table *Table) error {
+	repo := New(d.DB)
 
-var prefix = []byte("\n\n--\n-- ")
-var postfix = []byte("--\n")
+	fileName := filepath.Join(d.Output, table.Name+".sql")
+	logrus.Debugf("creating file %s", fileName)
 
-func (f *Formatter) Format(entry *logrus.Entry) ([]byte, error) {
-	b, err := f.Formatter.Format(entry)
+	file, err := os.Create(fileName)
 	if err != nil {
-		return b, err
+		return err
 	}
 
-	b = append(prefix, b...)
-	b = append(b, postfix...)
+	defer file.Close()
 
-	return b, err
+	if !d.NoHeaders {
+		str := fmt.Sprintf("--\n-- Structure for table `%s`\n--\n\n", table.Name)
+
+		_, err := io.WriteString(file, str)
+		if err != nil {
+			return fmt.Errorf("unable to write %s to file: %s", str, err)
+		}
+	}
+
+	if !d.NoDropTable {
+		str := fmt.Sprintf("DROP TABLE IF EXISTS `%s`;\n", table.Name)
+
+		_, err := io.WriteString(file, str)
+		if err != nil {
+			return fmt.Errorf("unable to write %s to file: %s", str, err)
+		}
+	}
+
+	if !d.NoCreateTable {
+		logrus.Debugf("getting DLL for table %s", table.Name)
+
+		dll, err := repo.GetCreateTable(ctx, *table)
+		if err != nil {
+			return err
+		}
+
+		str := fmt.Sprintf("%s;\n", dll)
+
+		_, err = io.WriteString(file, str)
+		if err != nil {
+			return fmt.Errorf("unable to write %s to file: %s", str, err)
+		}
+	}
+
+	if d.NoData {
+		return nil
+	}
+
+	count, err := repo.Count(ctx, table.Name)
+	if err != nil {
+		return err
+	}
+
+	logrus.Debugf("count rows of table %s - %d", table.Name, count)
+
+	dataHeader := "\n"
+
+	if !d.NoHeaders {
+		dataHeader += fmt.Sprintf("-- %s's data [count=%d]\n", table.Name, count)
+	}
+
+	_, err = io.WriteString(file, dataHeader)
+	if err != nil {
+		return fmt.Errorf("unable to write %s to file: %s", dataHeader, err)
+	}
+
+	if count == 0 {
+		return nil
+	}
+
+	logrus.Debugf("gets values from repo for table %s", table.Name)
+
+	values, errors := repo.GetValues(ctx, *table, 5000000)
+
+	go func() {
+		for err := range errors {
+			logrus.Error(err)
+		}
+	}()
+
+	insert := []byte(fmt.Sprintf("INSERT INTO `%s` VALUES ", table.Name))
+	max, current := d.Limit, 0
+
+	buf := &bytes.Buffer{}
+	buf.Write(insert)
+
+	var (
+		openParenthesis   = []byte("(")
+		closedParenthesis = []byte(")")
+		comma             = []byte(",")
+		commaSpace        = []byte(", ")
+		eol               = []byte(";\n")
+	)
+
+	for raw := range values {
+		if current > 0 {
+			buf.Write(commaSpace)
+		}
+
+		buf.Write(openParenthesis)
+		buf.Write(bytes.Join(raw, comma))
+		buf.Write(closedParenthesis)
+		current++
+
+		if current == max {
+			//logrus.Debugf("writing %d rows to dump for table %s", current, table.Name)
+			buf.Write(eol)
+
+			_, err := buf.WriteTo(file)
+			if err != nil {
+				n := buf.Len()
+				if n > 100 {
+					n = 100
+				}
+
+				return fmt.Errorf("writing %s... failed: %s", buf.Bytes()[0:n], err)
+			}
+
+			buf.Reset()
+			buf.Write(insert)
+			current = 0
+		}
+	}
+
+	if current > 0 {
+		buf.Write(eol)
+
+		_, err := buf.WriteTo(file)
+		if err != nil {
+			n := buf.Len()
+			if n > 100 {
+				n = 100
+			}
+
+			return fmt.Errorf("writing %s... failed: %s", buf.Bytes()[0:n], err)
+		}
+	}
+
+	return nil
 }

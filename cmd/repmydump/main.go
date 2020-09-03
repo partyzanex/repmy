@@ -4,11 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/sirupsen/logrus"
 	"os"
 	"os/signal"
 
 	"github.com/partyzanex/repmy/pkg/dump"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -21,7 +21,7 @@ var (
 	port    = pflag.Uint16P("port", "P", 3306, "port")
 	dbname  = pflag.StringP("database", "d", "", "database")
 	workers = pflag.IntP("treads", "t", 1, "number of treads")
-	limit   = pflag.IntP("limit", "l", 10000, "limit of rows")
+	limit   = pflag.IntP("limit", "l", 10, "limit of rows")
 	verbose = pflag.BoolP("verbose", "v", false, "verbose progress")
 	output  = pflag.StringP("output", "o", "dump", "output dir")
 
@@ -43,20 +43,20 @@ func main() {
 	}
 
 	if *user == "" {
-		fatal("flag --user is required")
+		exit("flag --user is required")
 	}
 
 	if *dbname == "" {
-		fatal("flag --db is required")
+		exit("flag --db is required")
 	}
 
 	if *output == "" {
-		fatal("flag --output is required")
+		exit("flag --output is required")
 	}
 
 	if err := os.MkdirAll(*output, 0755); err != nil {
 		if !os.IsExist(err) {
-			fatal(err.Error())
+			exit(err.Error())
 		}
 	}
 
@@ -64,24 +64,16 @@ func main() {
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		fatal(err.Error())
+		exit(err.Error())
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 
 	quit := make(chan os.Signal)
 	signal.Notify(quit, os.Interrupt, os.Kill)
 
 	go func() {
 		<-quit
-		cancel()
+		exit("exited")
 	}()
-
-	//if *file == "" {
-	//	logrus.SetFormatter(&dump.Formatter{
-	//		Formatter: &logrus.TextFormatter{},
-	//	})
-	//}
 
 	d := dump.Dumper{
 		DB:            db,
@@ -95,13 +87,13 @@ func main() {
 		Verbose:       *verbose,
 	}
 
-	err = d.Dump(ctx, *tables...)
+	err = d.Dump(context.Background(), *tables...)
 	if err != nil {
-		fatal(err.Error())
+		exit(err.Error())
 	}
 }
 
-func fatal(msg string) {
-	fmt.Println(msg)
+func exit(msg string) {
+	logrus.Info(msg)
 	os.Exit(0)
 }

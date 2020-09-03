@@ -1,7 +1,6 @@
 package dump
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -130,7 +129,7 @@ func (repo *Repository) GetTableColumns(ctx context.Context, table string) ([]st
 }
 
 func (repo *Repository) GetSelectQuery(columns []string, table string, limit, offset int) string {
-	cols := strings.Join(columns, ",")
+	cols := "`" + strings.Join(columns, "`, `") + "`"
 	query := fmt.Sprintf("SELECT %s FROM `%s`", cols, table)
 
 	if limit > 0 {
@@ -140,93 +139,72 @@ func (repo *Repository) GetSelectQuery(columns []string, table string, limit, of
 	return query
 }
 
-func (repo *Repository) GetInserts(ctx context.Context, query string, table Table) ([]string, error) {
+var (
+	null  = []byte("NULL")
+	quote = []byte("'")
+)
+
+func (repo *Repository) GetValues(ctx context.Context, table Table, size int) (<-chan [][]byte, <-chan error) {
 	if table.Type != "BASE TABLE" {
-		return []string{}, nil
+		return nil, nil
 	}
 
-	rows, err := repo.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("unable to execute query '%s': %s", query, err)
-	}
+	results := make(chan [][]byte, size)
+	errors := make(chan error)
 
-	defer rows.Close()
+	go func() {
+		defer func() {
+			close(results)
+			close(errors)
+		}()
 
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("unable to get columnt: %s", err)
-	}
-
-	n := len(columns)
-	values := make([]*sql.RawBytes, n)
-	args := make([]interface{}, n)
-
-	for i := range values {
-		args[i] = &values[i]
-	}
-
-	var (
-		data   = make([]string, 0)
-		raw    = make([]string, n)
-		insert = fmt.Sprintf("INSERT INTO `%s` VALUES", table.Name)
-		null   = "NULL"
-	)
-
-	for rows.Next() {
-		err := rows.Scan(args...)
+		columns, err := repo.GetTableColumns(ctx, table.Name)
 		if err != nil {
-			return nil, fmt.Errorf("unable to scan row: %s", err)
+			errors <- fmt.Errorf("unable to get table columns: %s", err)
+			return
 		}
 
-		for i, col := range values {
-			val := null
+		query := repo.GetSelectQuery(columns, table.Name, 0, 0)
 
-			if col != nil {
-				val = "'" + Escape(string(*col)) + "'"
+		rows, err := repo.db.QueryContext(ctx, query)
+		if err != nil {
+			errors <- fmt.Errorf("unable to execute query '%s': %s", query, err)
+			return
+		}
+
+		defer rows.Close()
+
+		n := len(columns)
+		values := make([]*sql.RawBytes, n)
+		args := make([]interface{}, n)
+
+		for i := range values {
+			args[i] = &values[i]
+		}
+
+		for rows.Next() {
+			err := rows.Scan(args...)
+			if err != nil {
+				errors <- fmt.Errorf("unable to scan row: %s", err)
+				return
 			}
 
-			raw[i] = val
+			raw := make([][]byte, n)
+
+			for i, col := range values {
+				val := null
+
+				if col != nil {
+					val = append(quote, Escape(*col)...)
+					val = append(val, quote...)
+				}
+
+				raw[i] = val
+			}
+
+			results <- raw
 		}
+	}()
 
-		data = append(data, insert+" ("+strings.Join(raw, ", ")+");")
-	}
-
-	return data, nil
-}
-
-func Escape(str string) string {
-	var (
-		esc  string
-		buf  bytes.Buffer
-		last int
-	)
-
-	for i, c := range str {
-		switch c {
-		case 0:
-			esc = `\0`
-		case '\n':
-			esc = `\n`
-		case '\r':
-			esc = `\r`
-		case '\\':
-			esc = `\\`
-		case '\'':
-			esc = `\'`
-		case '"':
-			esc = `\"`
-		case '\032':
-			esc = `\Z`
-		default:
-			continue
-		}
-
-		buf.WriteString(str[last:i])
-		buf.WriteString(esc)
-		last = i + 1
-	}
-
-	buf.WriteString(str[last:])
-
-	return buf.String()
+	return results, errors
 }
