@@ -20,8 +20,10 @@ var (
 	host    = pflag.StringP("host", "h", "localhost", "hostname")
 	port    = pflag.Uint16P("port", "P", 3306, "port")
 	dbname  = pflag.StringP("database", "d", "", "database")
-	workers = pflag.IntP("treads", "t", 1, "number of treads")
-	limit   = pflag.IntP("limit", "l", 10, "limit of rows")
+	threads = pflag.IntP("threads", "t", 1, "the number of tables read at the same time")
+	workers = pflag.IntP("workers", "w", 1, "number of simultaneous reads from one table")
+	buffer  = pflag.IntP("buffer", "b", 100000, "max buffer size in rows, affects memory allocation")
+	max     = pflag.IntP("max-rows", "m", 1000, "number of rows written in one insert")
 	verbose = pflag.BoolP("verbose", "v", false, "verbose progress")
 	output  = pflag.StringP("output", "o", "dump", "output dir")
 
@@ -78,8 +80,10 @@ func main() {
 	d := dump.Dumper{
 		DB:            db,
 		Output:        *output,
+		Threads:       *threads,
 		Workers:       *workers,
-		Limit:         *limit,
+		Buffer:        *buffer,
+		MaxRows:       *max,
 		NoHeaders:     *noHeaders,
 		NoDropTable:   *noDropTable,
 		NoCreateTable: *noCreateTable,

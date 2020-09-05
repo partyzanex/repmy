@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
+	"github.com/partyzanex/repmy/pkg/pool"
+	"github.com/sirupsen/logrus"
+	"math"
 )
 
 type Repository struct {
@@ -72,8 +74,8 @@ type Config struct {
 	NoData      bool
 }
 
-func (repo *Repository) Count(ctx context.Context, table string) (count uint64, err error) {
-	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)
+func (repo *Repository) Count(ctx context.Context, table Table) (count uint64, err error) {
+	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table.Name)
 	row := repo.db.QueryRowContext(ctx, query)
 	err = row.Scan(&count)
 
@@ -85,7 +87,7 @@ func (repo *Repository) GetCreateTable(ctx context.Context, table Table) (string
 
 	var tableName, dll string
 
-	if table.Type == "BASE TABLE" {
+	if table.Type == BaseTable {
 		err := row.Scan(&tableName, &dll)
 
 		if err != nil {
@@ -93,7 +95,7 @@ func (repo *Repository) GetCreateTable(ctx context.Context, table Table) (string
 		}
 	}
 
-	if table.Type == "VIEW" {
+	if table.Type == View {
 		var character, collation string
 
 		err := row.Scan(&tableName, &dll, &character, &collation)
@@ -110,8 +112,8 @@ func (repo *Repository) GetCreateTable(ctx context.Context, table Table) (string
 
 }
 
-func (repo *Repository) GetTableColumns(ctx context.Context, table string) ([]string, error) {
-	query := fmt.Sprintf("SELECT * FROM `%s` LIMIT 1", table)
+func (repo *Repository) GetTableColumns(ctx context.Context, table Table) ([]string, error) {
+	query := fmt.Sprintf("SELECT * FROM `%s` LIMIT 1", table.Name)
 
 	rows, err := repo.db.QueryContext(ctx, query)
 	if err != nil {
@@ -128,9 +130,9 @@ func (repo *Repository) GetTableColumns(ctx context.Context, table string) ([]st
 	return columns, nil
 }
 
-func (repo *Repository) GetSelectQuery(columns []string, table string, limit, offset int) string {
-	cols := "`" + strings.Join(columns, "`, `") + "`"
-	query := fmt.Sprintf("SELECT %s FROM `%s`", cols, table)
+// todo: replace query to SHOW COLUMNS FROM table
+func (repo *Repository) GetSelectQuery(table Table, limit, offset int) string {
+	query := fmt.Sprintf("SELECT %s FROM `%s`", table.GetColumns(), table.Name)
 
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
@@ -144,12 +146,12 @@ var (
 	quote = []byte("'")
 )
 
-func (repo *Repository) GetValues(ctx context.Context, table Table, size int) (<-chan [][]byte, <-chan error) {
-	if table.Type != "BASE TABLE" {
+func (repo *Repository) GetValues(ctx context.Context, table Table, buffer, workers int) (<-chan [][]byte, <-chan error) {
+	if table.Type != BaseTable {
 		return nil, nil
 	}
 
-	results := make(chan [][]byte, size)
+	results := make(chan [][]byte, buffer)
 	errors := make(chan error)
 
 	go func() {
@@ -158,52 +160,33 @@ func (repo *Repository) GetValues(ctx context.Context, table Table, size int) (<
 			close(errors)
 		}()
 
-		columns, err := repo.GetTableColumns(ctx, table.Name)
-		if err != nil {
-			errors <- fmt.Errorf("unable to get table columns: %s", err)
-			return
-		}
+		limit, size := 1, 0
 
-		query := repo.GetSelectQuery(columns, table.Name, 0, 0)
+		if buffer > 0 {
+			limit = int(math.Ceil(float64(table.Count) / float64(workers)))
 
-		rows, err := repo.db.QueryContext(ctx, query)
-		if err != nil {
-			errors <- fmt.Errorf("unable to execute query '%s': %s", query, err)
-			return
-		}
-
-		defer rows.Close()
-
-		n := len(columns)
-		values := make([]*sql.RawBytes, n)
-		args := make([]interface{}, n)
-
-		for i := range values {
-			args[i] = &values[i]
-		}
-
-		for rows.Next() {
-			err := rows.Scan(args...)
-			if err != nil {
-				errors <- fmt.Errorf("unable to scan row: %s", err)
-				return
+			if limit > buffer {
+				size = workers
 			}
-
-			raw := make([][]byte, n)
-
-			for i, col := range values {
-				val := null
-
-				if col != nil {
-					val = append(quote, Escape(*col)...)
-					val = append(val, quote...)
-				}
-
-				raw[i] = val
-			}
-
-			results <- raw
 		}
+
+		workers := pool.NewWorkersPool(pool.Size(size), pool.WithCtx(ctx))
+
+		logrus.Debugf("runs %d workers with limit=%d and buffer=%d", size, limit, buffer)
+
+		for i := 0; i < size; i++ {
+			workers.AddTask(&task{
+				Num:     i + 1,
+				Table:   table,
+				Repo:    repo,
+				Limit:   limit,
+				Offset:  i * limit,
+				Results: results,
+				Errors:  errors,
+			})
+		}
+
+		workers.Wait()
 	}()
 
 	return results, errors
