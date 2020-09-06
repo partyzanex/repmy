@@ -15,11 +15,8 @@ import (
 )
 
 var (
-	user    = pflag.StringP("user", "u", "", "user")
-	pass    = pflag.StringP("password", "p", "", "password")
-	host    = pflag.StringP("host", "h", "localhost", "hostname")
-	port    = pflag.Uint16P("port", "P", 3306, "port")
-	dbname  = pflag.StringP("database", "d", "", "database")
+	source  = pflag.StringP("source", "s", "", "source DSN, ex. 'user:password@tcp(localhost:3306)/source_db'")
+	dest    = pflag.StringP("dest", "d", "", "destination DSN, ex. 'user:password@tcp(localhost:3306)/dest_db'")
 	threads = pflag.IntP("threads", "t", 1, "the number of tables read at the same time")
 	workers = pflag.IntP("workers", "w", 1, "number of simultaneous reads from one table")
 	buffer  = pflag.IntP("buffer", "b", 100000, "max buffer size in rows, affects memory allocation")
@@ -29,10 +26,9 @@ var (
 
 	tables = pflag.StringSlice("tables", []string{}, "tables list")
 
-	noHeaders     = pflag.Bool("no-headers", false, "dump tables without headers")
-	noDropTable   = pflag.Bool("no-drop-table", false, "dump tables without DROP TABLE IF EXISTS ...")
-	noCreateTable = pflag.Bool("no-create-table", false, "dump tables without DLL (data only)")
-	noData        = pflag.Bool("no-data", false, "dump only DLL (without data)")
+	noHeaders   = pflag.Bool("no-headers", false, "dump tables without headers")
+	noDropTable = pflag.Bool("no-drop-table", false, "dump tables without DROP TABLE IF EXISTS ...")
+	noData      = pflag.Bool("no-data", false, "dump only DLL (without data)")
 
 	debug = pflag.Bool("debug", false, "debug mode")
 )
@@ -44,29 +40,31 @@ func main() {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	if *user == "" {
-		exit("flag --user is required")
+	if *source == "" {
+		exit("flag --source [-s] is required")
 	}
 
-	if *dbname == "" {
-		exit("flag --db is required")
-	}
+	//if *output == "" {
+	//	exit("flag --output is required")
+	//}
 
-	if *output == "" {
-		exit("flag --output is required")
-	}
+	var (
+		src, dst *sql.DB
+		err      error
+	)
 
-	if err := os.MkdirAll(*output, 0755); err != nil {
-		if !os.IsExist(err) {
-			exit(err.Error())
-		}
-	}
+	_ = dst
 
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", *user, *pass, *host, *port, *dbname)
-
-	db, err := sql.Open("mysql", dsn)
+	src, err = sql.Open("mysql", *source)
 	if err != nil {
-		exit(err.Error())
+		exit(fmt.Sprintf("unable to open source database: %s", err))
+	}
+
+	if *dest != "" {
+		dst, err = sql.Open("mysql", *dest)
+		if err != nil {
+			exit(fmt.Sprintf("unable to open destination database: %s", err))
+		}
 	}
 
 	quit := make(chan os.Signal)
@@ -78,20 +76,37 @@ func main() {
 	}()
 
 	d := dump.Dumper{
-		DB:            db,
-		Output:        *output,
-		Threads:       *threads,
-		Workers:       *workers,
-		Buffer:        *buffer,
-		MaxRows:       *max,
-		NoHeaders:     *noHeaders,
-		NoDropTable:   *noDropTable,
-		NoCreateTable: *noCreateTable,
-		NoData:        *noData,
-		Verbose:       *verbose,
+		Source:      src,
+		Output:      *output,
+		Threads:     *threads,
+		Workers:     *workers,
+		Buffer:      *buffer,
+		MaxRows:     *max,
+		NoHeaders:   *noHeaders,
+		NoDropTable: *noDropTable,
+		NoData:      *noData,
+		Verbose:     *verbose,
 	}
 
-	err = d.Dump(context.Background(), *tables...)
+	ctx := context.Background()
+
+	dll, err := dump.NewFileWriter(*output, "__dll.sql")
+	if err != nil {
+		exit(err.Error())
+	}
+
+	err = d.DumpDLL(ctx, dll, *tables...)
+	if err != nil {
+		_ = dll.Close()
+		exit(err.Error())
+	}
+
+	dir, err := dump.NewDirWriter(*output)
+	if err != nil {
+		exit(err.Error())
+	}
+
+	err = d.DumpData(ctx, dir, *tables...)
 	if err != nil {
 		exit(err.Error())
 	}

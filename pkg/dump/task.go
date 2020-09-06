@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/sirupsen/logrus"
 )
 
 type task struct {
@@ -20,6 +22,8 @@ func (t task) ID() int {
 }
 
 func (t *task) Run(ctx context.Context) error {
+	logrus.Debugf("task %d for table %s started", t.ID(), t.Table.Name)
+
 	repo := t.Repo
 	table := t.Table
 	errors := t.Errors
@@ -70,6 +74,7 @@ func (t *task) Run(ctx context.Context) error {
 			raw[i] = val
 		}
 
+		//logrus.Debug(len(raw))
 		results <- raw
 	}
 

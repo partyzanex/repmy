@@ -6,8 +6,6 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sync"
 
 	"github.com/partyzanex/repmy/pkg/pool"
@@ -19,8 +17,9 @@ var (
 )
 
 type Dumper struct {
-	DB *sql.DB
+	Source *sql.DB
 
+	Dest   io.WriteCloser
 	Output string
 
 	Threads int
@@ -28,27 +27,71 @@ type Dumper struct {
 	MaxRows int
 	Buffer  int
 
-	NoHeaders     bool
-	NoDropTable   bool
-	NoCreateTable bool
-	NoData        bool
-	Verbose       bool
+	NoHeaders   bool
+	NoDropTable bool
+	NoData      bool
+	Verbose     bool
 
 	repo *Repository
 }
 
 func (d *Dumper) Repo() *Repository {
 	if d.repo == nil {
-		d.repo = New(d.DB)
+		d.repo = New(d.Source)
 	}
 
 	return d.repo
 }
 
-func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
+func (d *Dumper) DumpDLL(ctx context.Context, w io.WriteCloser, tables ...string) (err error) {
+	defer closeWriter(w, err)
+
+	buf := &bytes.Buffer{}
+
 	toDump, err := d.getTablesForDump(ctx, tables...)
 	if err != nil {
-		return err
+		return
+	}
+
+	if d.Verbose {
+		logrus.Infof("create DLL dump for %d tables", len(toDump))
+	}
+
+	for _, table := range toDump {
+		err = d.writeTableHeaders(buf, table)
+		if err != nil {
+			return
+		}
+
+		err = d.writeDropTable(buf, table)
+		if err != nil {
+			return
+		}
+
+		err = d.writeCreateTable(ctx, buf, table)
+		if err != nil {
+			return
+		}
+	}
+
+	_, err = buf.WriteTo(w)
+	if err != nil {
+		return
+	}
+
+	if d.Verbose {
+		logrus.Infof("DLL was been successfully created for %d tables", len(toDump))
+	}
+
+	return
+}
+
+func (d *Dumper) DumpData(ctx context.Context, w io.WriteCloser, tables ...string) (err error) {
+	defer closeWriter(w, err)
+
+	toDump, err := d.getTablesForDump(ctx, tables...)
+	if err != nil {
+		return
 	}
 
 	if d.Verbose {
@@ -57,11 +100,12 @@ func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 
 	_, err = d.Repo().FlushTablesWithReadLock(ctx)
 	if err != nil {
-		return fmt.Errorf("flush tables with read lock failed: %s", err)
+		err = fmt.Errorf("flush tables with read lock failed: %s", err)
+		return
 	}
 
 	defer func() {
-		_, err = d.Repo().UnlockTables(ctx)
+		_, err := d.Repo().UnlockTables(ctx)
 		if err != nil {
 			logrus.Error(err)
 			return
@@ -72,9 +116,9 @@ func (d *Dumper) Dump(ctx context.Context, tables ...string) error {
 		}
 	}()
 
-	d.Run(ctx, toDump...)
+	d.dumpData(ctx, w, toDump...)
 
-	return nil
+	return
 }
 
 func (d *Dumper) getTablesForDump(ctx context.Context, tables ...string) ([]*Table, error) {
@@ -108,7 +152,7 @@ func (d *Dumper) getTablesForDump(ctx context.Context, tables ...string) ([]*Tab
 	return toDump, nil
 }
 
-func (d *Dumper) Run(ctx context.Context, tables ...*Table) {
+func (d *Dumper) dumpData(ctx context.Context, w io.Writer, tables ...*Table) {
 	if d.Verbose {
 		logrus.Infof("runs dump for %d tables", len(tables))
 	}
@@ -128,7 +172,7 @@ func (d *Dumper) Run(ctx context.Context, tables ...*Table) {
 		errs := processes.Errors()
 
 		for err := range errs {
-			logrus.Error(err)
+			logrus.Errorf("process error: %s", err)
 		}
 
 		return nil
@@ -139,14 +183,14 @@ func (d *Dumper) Run(ctx context.Context, tables ...*Table) {
 	}
 
 	for i := 0; i < d.Threads; i++ {
-		processes.RunProcess(ctx, d.processDump(tch), nil)
+		processes.RunProcess(ctx, d.processDump(tch, w), nil)
 	}
 
 	processes.Wait()
 	errors.Wait()
 }
 
-func (d *Dumper) processDump(tables <-chan *Table) pool.Process {
+func (d *Dumper) processDump(tables <-chan *Table, w io.Writer) pool.Process {
 	return func(ctx context.Context) error {
 		for table := range tables {
 			if d.Verbose {
@@ -160,7 +204,7 @@ func (d *Dumper) processDump(tables <-chan *Table) pool.Process {
 
 			table.Columns = columns
 
-			err = d.dumpTable(ctx, table)
+			err = d.dumpTable(ctx, w, table)
 			if err != nil {
 				return err
 			}
@@ -182,56 +226,7 @@ var (
 	eol               = []byte(";\n")
 )
 
-func (d *Dumper) dumpTable(ctx context.Context, table *Table) (err error) {
-	fileName := filepath.Join(d.Output, table.Name+".sql")
-
-	logrus.Debugf("creating file %s", fileName)
-
-	file, err := os.Create(fileName)
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		errCl := file.Close()
-		if err != nil && errCl != nil {
-			err = fmt.Errorf("dump table returns many errors: %s; %s", err, errCl)
-		}
-
-		if err == nil && errCl != nil {
-			err = errCl
-		}
-	}()
-
-	err = d.writeTableHeaders(file, table)
-	if err != nil {
-		return
-	}
-
-	err = d.writeDropTable(file, table)
-	if err != nil {
-		return
-	}
-
-	err = d.writeCreateTable(ctx, file, table)
-	if err != nil {
-		return
-	}
-
-	errWr := d.writeDataHeaders(ctx, file, table)
-	if errWr != nil && errWr != ErrNoTableRows {
-		err = errWr
-		return
-	}
-
-	if err == ErrNoTableRows {
-		return
-	}
-
-	logrus.Debugf("gets values from repo for table %s", table.Name)
-
-	values, errors := d.Repo().GetValues(ctx, *table, d.Buffer, d.Workers)
-
+func (d *Dumper) dumpTable(ctx context.Context, w io.Writer, table *Table) (err error) {
 	var (
 		wg  = &sync.WaitGroup{}
 		buf = &bytes.Buffer{}
@@ -241,12 +236,25 @@ func (d *Dumper) dumpTable(ctx context.Context, table *Table) (err error) {
 		current = 0
 	)
 
+	err = d.writeDataHeaders(ctx, buf, table)
+	if err != nil && err != ErrNoTableRows {
+		return
+	}
+
+	if err == ErrNoTableRows {
+		return nil
+	}
+
+	logrus.Debugf("gets values from repo for table %s", table.Name)
+
+	values, errors := d.Repo().GetValues(ctx, *table, d.Buffer, d.Workers)
+
 	buf.Write(insert)
 	wg.Add(1)
 
 	go func() {
 		for err := range errors {
-			logrus.Error(err)
+			logrus.Errorf("err: %s", err)
 		}
 
 		wg.Done()
@@ -256,7 +264,7 @@ Results:
 	for {
 		select {
 		case raw, ok := <-values:
-			if !ok {
+			if !ok && raw == nil {
 				break Results
 			}
 
@@ -267,11 +275,12 @@ Results:
 			buf.Write(openParenthesis)
 			buf.Write(bytes.Join(raw, comma))
 			buf.Write(closedParenthesis)
+			current++
 
-			if current++; current == max {
+			if current == max {
 				buf.Write(eol)
 
-				err = d.writeBuffer(buf, file)
+				err = d.writeBuffer(buf, w)
 				if err != nil {
 					return
 				}
@@ -286,7 +295,7 @@ Results:
 	if current > 0 {
 		buf.Write(eol)
 
-		err = d.writeBuffer(buf, file)
+		err = d.writeBuffer(buf, w)
 		if err != nil {
 			return
 		}
@@ -324,20 +333,18 @@ func (d *Dumper) writeDropTable(w io.Writer, table *Table) error {
 }
 
 func (d *Dumper) writeCreateTable(ctx context.Context, w io.Writer, table *Table) error {
-	if !d.NoCreateTable {
-		logrus.Debugf("getting DLL for table %s", table.Name)
+	logrus.Debugf("getting DLL for table %s", table.Name)
 
-		dll, err := d.Repo().GetCreateTable(ctx, *table)
-		if err != nil {
-			return err
-		}
+	dll, err := d.Repo().GetCreateTable(ctx, *table)
+	if err != nil {
+		return err
+	}
 
-		str := fmt.Sprintf("%s;\n", dll)
+	str := fmt.Sprintf("%s;\n\n", dll)
 
-		_, err = io.WriteString(w, str)
-		if err != nil {
-			return fmt.Errorf("unable to write %s to file: %s", str, err)
-		}
+	_, err = io.WriteString(w, str)
+	if err != nil {
+		return fmt.Errorf("unable to write %s to file: %s", str, err)
 	}
 
 	return nil
@@ -345,7 +352,7 @@ func (d *Dumper) writeCreateTable(ctx context.Context, w io.Writer, table *Table
 
 func (d *Dumper) writeDataHeaders(ctx context.Context, w io.Writer, table *Table) error {
 	if d.NoData {
-		return nil
+		return ErrNoTableRows
 	}
 
 	count, err := d.Repo().Count(ctx, *table)
@@ -353,7 +360,9 @@ func (d *Dumper) writeDataHeaders(ctx context.Context, w io.Writer, table *Table
 		return err
 	}
 
-	dataHeader := "\n"
+	table.Count = count
+
+	dataHeader := ""
 
 	if !d.NoHeaders {
 		dataHeader += fmt.Sprintf("-- %s's data [count=%d]\n", table.Name, count)
@@ -363,8 +372,6 @@ func (d *Dumper) writeDataHeaders(ctx context.Context, w io.Writer, table *Table
 	if err != nil {
 		return fmt.Errorf("unable to write %s to file: %s", dataHeader, err)
 	}
-
-	table.Count = count
 
 	if count == 0 {
 		return ErrNoTableRows

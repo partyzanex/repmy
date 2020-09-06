@@ -368,7 +368,8 @@ func TestRepository_GetValues3(t *testing.T) {
 	Loop:
 		for {
 			v, ok := <-results
-			t.Logf("%s %v", v, ok)
+			_ = v
+			//t.Logf("%s %v", v, ok)
 			if !ok {
 				break Loop
 			}

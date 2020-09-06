@@ -160,7 +160,7 @@ func (repo *Repository) GetValues(ctx context.Context, table Table, buffer, work
 			close(errors)
 		}()
 
-		limit, size := 1, 0
+		limit, size := 0, 1
 
 		if buffer > 0 {
 			limit = int(math.Ceil(float64(table.Count) / float64(workers)))
