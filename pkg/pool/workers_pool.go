@@ -23,7 +23,7 @@ func Size(size int) Option {
 
 type Task interface {
 	Run(ctx context.Context) error
-	ID() int
+	ID() interface{}
 }
 
 type WorkersPool struct {

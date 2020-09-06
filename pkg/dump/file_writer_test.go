@@ -31,7 +31,7 @@ func TestFileWriter_Write(t *testing.T) {
 		}
 	}()
 
-	dir, err := dump.NewDirWriter(dirName)
+	dir, err := dump.NewDirWriter(dirName, false)
 	testutils.FatalErr(t, "dump.NewDirWriter", err)
 
 	defer func() {

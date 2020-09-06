@@ -48,7 +48,7 @@ func (d *Dumper) DumpDLL(ctx context.Context, w io.WriteCloser, tables ...string
 
 	buf := &bytes.Buffer{}
 
-	toDump, err := d.getTablesForDump(ctx, tables...)
+	toDump, err := d.GetTablesForDump(ctx, tables...)
 	if err != nil {
 		return
 	}
@@ -89,7 +89,7 @@ func (d *Dumper) DumpDLL(ctx context.Context, w io.WriteCloser, tables ...string
 func (d *Dumper) DumpData(ctx context.Context, w io.WriteCloser, tables ...string) (err error) {
 	defer closeWriter(w, err)
 
-	toDump, err := d.getTablesForDump(ctx, tables...)
+	toDump, err := d.GetTablesForDump(ctx, tables...)
 	if err != nil {
 		return
 	}
@@ -121,7 +121,7 @@ func (d *Dumper) DumpData(ctx context.Context, w io.WriteCloser, tables ...strin
 	return
 }
 
-func (d *Dumper) getTablesForDump(ctx context.Context, tables ...string) ([]*Table, error) {
+func (d *Dumper) GetTablesForDump(ctx context.Context, tables ...string) ([]*Table, error) {
 	tbs, err := d.Repo().GetTables(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("unable to get tables: %s", err)

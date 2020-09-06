@@ -18,6 +18,12 @@ var (
 	prefixLength = len(insertPrefix)
 )
 
+type DirWriter interface {
+	io.WriteCloser
+
+	GetFile(name string) (io.WriteCloser, error)
+}
+
 type dirWriter struct {
 	dir  string
 	gzip bool
@@ -26,7 +32,7 @@ type dirWriter struct {
 	mu    *sync.RWMutex
 }
 
-func NewDirWriter(dir string, gz bool) (io.WriteCloser, error) {
+func NewDirWriter(dir string, gz bool) (DirWriter, error) {
 	err := createDir(dir)
 	if err != nil {
 		return nil, err
@@ -82,6 +88,10 @@ func (w *dirWriter) Close() (err error) {
 	})
 
 	return
+}
+
+func (w *dirWriter) GetFile(name string) (io.WriteCloser, error) {
+	return w.getFile(filepath.Base(name))
 }
 
 func (w *dirWriter) mustClosed(b []byte, f io.Closer) error {

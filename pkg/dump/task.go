@@ -17,7 +17,7 @@ type task struct {
 	Errors        chan<- error
 }
 
-func (t task) ID() int {
+func (t task) ID() interface{} {
 	return t.Num
 }
 
