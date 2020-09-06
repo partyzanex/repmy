@@ -4,14 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"os/signal"
-
 	"github.com/partyzanex/repmy/pkg/dump"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
+	"os"
+	"os/signal"
+	"runtime"
+	"runtime/pprof"
 
 	_ "github.com/go-sql-driver/mysql"
+	_ "runtime/pprof"
 )
 
 var (
@@ -23,6 +25,7 @@ var (
 	max     = pflag.IntP("max-rows", "m", 1000, "number of rows written in one insert")
 	verbose = pflag.BoolP("verbose", "v", false, "verbose progress")
 	output  = pflag.StringP("output", "o", "dump", "output dir")
+	gzip    = pflag.BoolP("gzip", "z", false, "gzip compression")
 
 	tables = pflag.StringSlice("tables", []string{}, "tables list")
 
@@ -38,6 +41,33 @@ func main() {
 
 	if *debug {
 		logrus.SetLevel(logrus.DebugLevel)
+
+		cpu, err := os.Create("cpu_profile.out")
+		if err != nil {
+			exit(err.Error())
+		}
+
+		defer cpu.Close()
+
+		err = pprof.StartCPUProfile(cpu)
+		if err != nil {
+			exit(err.Error())
+		}
+
+		defer pprof.StopCPUProfile()
+
+		mem, err := os.Create("mem_profile.out")
+		if err != nil {
+			exit(err.Error())
+		}
+
+		defer mem.Close()
+		runtime.GC()
+
+		err = pprof.WriteHeapProfile(mem)
+		if err != nil {
+			exit(err.Error())
+		}
 	}
 
 	if *source == "" {
@@ -90,7 +120,7 @@ func main() {
 
 	ctx := context.Background()
 
-	dll, err := dump.NewFileWriter(*output, "__dll.sql")
+	dll, err := dump.NewFileWriter(*output, "__dll.sql", *gzip)
 	if err != nil {
 		exit(err.Error())
 	}
@@ -101,7 +131,7 @@ func main() {
 		exit(err.Error())
 	}
 
-	dir, err := dump.NewDirWriter(*output)
+	dir, err := dump.NewDirWriter(*output, *gzip)
 	if err != nil {
 		exit(err.Error())
 	}

@@ -294,6 +294,7 @@ Results:
 
 	if current > 0 {
 		buf.Write(eol)
+		buf.Write(endSuffix)
 
 		err = d.writeBuffer(buf, w)
 		if err != nil {

@@ -2,6 +2,7 @@ package dump
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
@@ -12,20 +13,20 @@ import (
 var (
 	insertPrefix = []byte("INSERT INTO `")
 	fileExt      = []byte(".sql")
+	endSuffix    = []byte("\n--\n-- end of data\n--\n")
 
 	prefixLength = len(insertPrefix)
 )
 
 type dirWriter struct {
-	dir string
+	dir  string
+	gzip bool
 
 	files *sync.Map
-	//fileMap map[string]int
-	//files   []*os.File
-	mu *sync.RWMutex
+	mu    *sync.RWMutex
 }
 
-func NewDirWriter(dir string) (io.WriteCloser, error) {
+func NewDirWriter(dir string, gz bool) (io.WriteCloser, error) {
 	err := createDir(dir)
 	if err != nil {
 		return nil, err
@@ -33,10 +34,9 @@ func NewDirWriter(dir string) (io.WriteCloser, error) {
 
 	writer := &dirWriter{
 		dir:   dir,
+		gzip:  gz,
 		files: &sync.Map{},
-		//files:   make([]*os.File, 0),
-		//fileMap: make(map[string]int),
-		mu: &sync.RWMutex{},
+		mu:    &sync.RWMutex{},
 	}
 
 	return writer, nil
@@ -55,12 +55,22 @@ func (w *dirWriter) Write(b []byte) (int, error) {
 		return 0, err
 	}
 
-	return f.Write(b)
+	n, err := f.Write(b)
+	if err != nil {
+		return n, err
+	}
+
+	err = w.mustClosed(b, f)
+	if err != nil {
+		return n, err
+	}
+
+	return n, err
 }
 
 func (w *dirWriter) Close() (err error) {
 	w.files.Range(func(key, value interface{}) bool {
-		file, ok := value.(*os.File)
+		file, ok := value.(io.WriteCloser)
 		if !ok {
 			err = fmt.Errorf("key %v, value %v is not a file descriptor", key, value)
 			return false
@@ -74,10 +84,18 @@ func (w *dirWriter) Close() (err error) {
 	return
 }
 
-func (w *dirWriter) getFile(fileName string) (*os.File, error) {
+func (w *dirWriter) mustClosed(b []byte, f io.Closer) error {
+	if i := bytes.Index(b, endSuffix); i <= 0 {
+		return nil
+	}
+
+	return f.Close()
+}
+
+func (w *dirWriter) getFile(fileName string) (io.WriteCloser, error) {
 	entry, ok := w.files.Load(fileName)
 	if !ok {
-		file, err := os.Create(filepath.Join(w.dir, fileName))
+		file, err := NewFileWriter(w.dir, fileName, w.gzip)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create file %s: %s", fileName, err)
 		}
@@ -87,7 +105,7 @@ func (w *dirWriter) getFile(fileName string) (*os.File, error) {
 		return file, nil
 	}
 
-	return entry.(*os.File), nil
+	return entry.(io.WriteCloser), nil
 }
 
 func (*dirWriter) parseFileName(b []byte) ([]byte, error) {
@@ -117,24 +135,44 @@ func (*dirWriter) parseFileName(b []byte) ([]byte, error) {
 }
 
 type fileWriter struct {
-	file *os.File
+	file io.WriteCloser
 }
 
-func NewFileWriter(dir, file string) (io.WriteCloser, error) {
+func NewFileWriter(dir, file string, gz bool) (io.WriteCloser, error) {
 	err := createDir(dir)
 	if err != nil {
 		return nil, err
 	}
 
+	if gz {
+		file += ".gz"
+	}
+
 	filePath := filepath.Join(dir, file)
 
-	f, err := os.Create(filePath)
+	if _, err := os.Stat(filePath); err == nil {
+		err := os.Remove(filePath)
+		if err != nil && os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+
+	var wc io.WriteCloser
+
+	wc, err = os.Create(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create file %s: %s", filePath, err)
 	}
 
+	if gz {
+		wc, err = gzip.NewWriterLevel(wc, gzip.BestSpeed)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create gzip writer: %s", err)
+		}
+	}
+
 	writer := &fileWriter{
-		file: f,
+		file: wc,
 	}
 
 	return writer, nil
