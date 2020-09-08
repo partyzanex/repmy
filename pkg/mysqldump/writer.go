@@ -1,6 +1,8 @@
 package mysqldump
 
-import "io"
+import (
+	"io"
+)
 
 type chanWriter struct {
 	results chan<- []byte
@@ -9,7 +11,7 @@ type chanWriter struct {
 func (w *chanWriter) Write(b []byte) (int, error) {
 	w.results <- b
 
-	return 0, nil
+	return len(b), nil
 }
 
 func (w *chanWriter) Close() error {

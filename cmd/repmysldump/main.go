@@ -4,20 +4,21 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"strings"
+
 	"github.com/go-sql-driver/mysql"
 	"github.com/partyzanex/repmy/pkg/dump"
 	"github.com/partyzanex/repmy/pkg/mysqldump"
 	"github.com/partyzanex/repmy/pkg/pool"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
-	"io"
-	"os"
-	"os/signal"
-	"strings"
 )
 
 var (
-	args    = pflag.StringP("args", "-a", "", "mysqldump arguments")
+	args    = pflag.StringP("args", "a", "", "mysqldump arguments")
 	tables  = pflag.StringSlice("tables", []string{}, "tables list")
 	threads = pflag.IntP("threads", "t", 1, "the number of tables read at the same time")
 	source  = pflag.StringP("source", "s", "", "source DSN, ex. 'user:password@tcp(localhost:3306)/source_db'")
@@ -26,6 +27,7 @@ var (
 
 func main() {
 	pflag.Parse()
+	//logrus.SetLevel(logrus.DebugLevel)
 
 	cfg, err := mysql.ParseDSN(*source)
 	if err != nil {
@@ -63,6 +65,16 @@ func main() {
 		return nil
 	}, nil)
 
+	errors.RunProcess(ctx, func(ctx context.Context) error {
+		errs := workers.Errors()
+
+		for err := range errs {
+			logrus.Debugf("ERR: %s", err)
+		}
+
+		return nil
+	}, nil)
+
 	tbs, err := dumper.GetTablesForDump(ctx, *tables...)
 	if err != nil {
 		logrus.Error(err)
@@ -86,11 +98,11 @@ func main() {
 	writers := make([]io.WriteCloser, len(tbs))
 
 	host, port := parseAddr(cfg.Addr)
-	creds := []string{"-u", cfg.User, "-p" + cfg.Passwd, "-h", host, "-P", port}
+	creds := []string{"-u", cfg.User, "-p" + cfg.Passwd, "-h", host, "-P", port, "-B", cfg.DBName}
 	a := append(creds, strings.Split(*args, " ")...)
 
 	for i, table := range tbs {
-		results[i] = make(chan []byte)
+		results[i] = make(chan []byte, 100)
 
 		processes.RunProcess(ctx, func(ctx context.Context) error {
 			result := results[i]
@@ -121,7 +133,7 @@ func main() {
 
 		writers[i] = mysqldump.NewWriter(results[i])
 
-		task := mysqldump.NewExecutor(writers[i], a...)
+		task := mysqldump.NewExecutor(writers[i], append(a, "--tables", table.Name)...)
 		workers.AddTask(task)
 	}
 
@@ -157,5 +169,3 @@ func parseAddr(addr string) (host, port string) {
 
 	return
 }
-
-type Result chan []byte

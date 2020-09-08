@@ -38,8 +38,8 @@ type WorkersPool struct {
 }
 
 func (p *WorkersPool) AddTask(task Task) {
-	logrus.Debugf("AddTask: task %d adding", task.ID())
-	defer logrus.Debugf("AddTask: task %d added", task.ID())
+	logrus.Debugf("AddTask: task '%v' adding", task.ID())
+	defer logrus.Debugf("AddTask: task '%v' added", task.ID())
 
 	p.tasks <- task
 }
@@ -90,6 +90,10 @@ func (p *WorkersPool) Wait() {
 	p.wg.Wait()
 
 	close(p.errs)
+}
+
+func (p *WorkersPool) Errors() <-chan error {
+	return p.errs
 }
 
 const (
